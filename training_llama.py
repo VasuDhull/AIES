@@ -1,69 +1,91 @@
 import os
 import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    Trainer,
+    TrainingArguments,
+    DataCollatorForLanguageModeling,
+)
 from datasets import load_dataset
-from transformers import LlamaTokenizer, LlamaForCausalLM, Trainer, TrainingArguments
-from accelerate import Accelerator
-from torch.utils.data import DataLoader
 
-# ---------- CONFIGURATION ----------
-# Set the GPUs you want to use (e.g., GPU 0 and 1)
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # Adjust as per your server's available GPUs
+# ---------------- CONFIG ----------------
+MODEL_NAME = "meta-llama/Llama-7b-hf"  # or Llama-13b if memory allows
+CORPUS_FILE = "dapt_data_final.txt"          # Your domain text file
+SAVE_DIR = "./dapt_llama_model"
+SEQ_LENGTH = 512                        # Max token length per sample
+BATCH_SIZE = 1                           # Adjust per GPU memory
+EPOCHS = 1                              # Start small
+GRAD_ACCUM = 4                          # Simulate larger batch
+FP16 = True                             # Mixed precision training
+GPU_ID = 0                               # The MIG GPU assigned
+# ----------------------------------------
 
-# Path to your domain-specific .txt file
-corpus_path = "path/to/your/dapt_corpus.txt"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-# Hyperparameters
-batch_size = 8
-max_length = 1024  # Max token length per sequence
-learning_rate = 5e-5
-num_train_epochs = 3
-logging_dir = "./logs"
-output_dir = "./output"
-# -------------------------------
+# Set GPU device explicitly
+device = torch.device(f"cuda:{GPU_ID}" if torch.cuda.is_available() else "cpu")
+torch.cuda.set_device(device)
+print(f"Using device: {device}")
 
-# Initialize Accelerator
-accelerator = Accelerator()
+# ---------------- LOAD TOKENIZER & MODEL ----------------
+print("Loading tokenizer and model...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-# Load the tokenizer and model
-tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-7B-hf")
-model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-7B-hf")
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    torch_dtype=torch.float16 if FP16 else torch.float32,
+).to(device)
 
-# Tokenize the dataset
-def tokenize_function(examples):
-    return tokenizer(examples['text'], truncation=True, padding='max_length', max_length=max_length)
+# ---------------- LOAD DATASET ----------------
+print("Loading dataset...")
+dataset = load_dataset("text", data_files={"train": CORPUS_FILE})
 
-# Load and prepare the dataset
-dataset = load_dataset('text', data_files={'train': corpus_path})
-tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+def tokenize_fn(examples):
+    return tokenizer(
+        examples["text"],
+        truncation=True,
+        max_length=SEQ_LENGTH,
+        padding="max_length",
+    )
 
-# Create DataLoader
-train_dataset = tokenized_datasets["train"]
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+tokenized_dataset = dataset.map(tokenize_fn, batched=True, remove_columns=["text"])
 
-# Define training arguments
-training_args = TrainingArguments(
-    output_dir=output_dir,
-    overwrite_output_dir=True,
-    num_train_epochs=num_train_epochs,
-    per_device_train_batch_size=batch_size,
-    gradient_accumulation_steps=1,
-    evaluation_strategy="epoch",
-    logging_dir=logging_dir,
-    logging_steps=500,
-    save_steps=500,
-    save_total_limit=2,
-    learning_rate=learning_rate,
-    fp16=True,  # Use mixed precision
-    report_to="tensorboard",
+# ---------------- DATA COLLATOR ----------------
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer,
+    mlm=False  # causal LM
 )
 
-# Initialize Trainer
+# ---------------- TRAINING ARGUMENTS ----------------
+training_args = TrainingArguments(
+    output_dir=SAVE_DIR,
+    overwrite_output_dir=True,
+    num_train_epochs=EPOCHS,
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    save_strategy="epoch",
+    logging_steps=50,
+    learning_rate=2e-5,
+    fp16=FP16,
+    report_to="none",  # disable wandb/tensorboard
+    save_total_limit=2,
+)
+
+# ---------------- TRAINER ----------------
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=train_dataset,
-    tokenizer=tokenizer,
+    train_dataset=tokenized_dataset["train"],
+    data_collator=data_collator,
 )
 
-# Start training
+# ---------------- TRAIN ----------------
+print("Starting DAPT training on single GPU...")
 trainer.train()
+
+# ---------------- SAVE MODEL ----------------
+print(f"Saving trained model to {SAVE_DIR}...")
+model.save_pretrained(SAVE_DIR)
+tokenizer.save_pretrained(SAVE_DIR)
+print("DAPT training complete!")
